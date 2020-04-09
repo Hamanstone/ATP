@@ -70,6 +70,8 @@ def on_press(key):
         # uart_send_q.put('sh /sdk/insmod_rndis.sh\r\n')
         # uart_send_q.put('diag hw pcba\r\n')
         uart_send_q.put('diag factory poweroff\r\n')
+    if k == '6':
+        is_idle()
     if k == 'q':
         ser.close()
         for idx in range(3):
@@ -147,7 +149,14 @@ def is_booting(console_log):
 
 
 def is_idle():
-
+    if uart_console_reg["status"] == status_flag[0]:
+        uart_send_q.put('\r\n')
+        time.sleep(0.5)
+        last_reply = (datetime.now() - uart_console_reg["last_timestamp"]).total_seconds()
+        if last_reply < 1 and uart_console_reg["last_msg"] == "/ # \r\n":
+            print(status_flag[0])
+            return 1
+    return 0
 
 
 def update_uart_console_reg(target, data):
