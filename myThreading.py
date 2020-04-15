@@ -11,8 +11,8 @@ import queue  # 先进先出队列
 from tools import *
 
 # Public and global variable configure zone
-COM_PORT = 'COM4'    # 指定通訊埠名稱
-BAUD_RATES = 115200    # 設定傳輸速率
+COM_PORT = 'COM4'  # 指定通訊埠名稱
+BAUD_RATES = 115200  # 設定傳輸速率
 ser = serial.Serial(COM_PORT, BAUD_RATES)  # 初始化序列通訊埠
 IPS_800_COM_PORT = 'COM3'
 IPS_800_BAUD_RATES = 9600
@@ -22,12 +22,33 @@ uart_send_q = queue.Queue(10)
 uart_read_q = queue.Queue(10)
 ips_send_q = queue.Queue(1)
 ips_check_pwr_q = queue.Queue(1)
+uart_cmd_request_q = queue.Queue(1)
+uart_cmd_response_q = queue.Queue(1)
 
 # SHOW_DBG_MSG = True
 SHOW_DBG_MSG = False
 status_flag = ["IDLE", "BOOTING", "RUNNING", "HALTED", "UNKNOWN"]
 power_flag = ""
+new_start_flag = False
 uart_console = {"last_msg": "", "last_timestamp": datetime.now(), "status": status_flag[4]}
+log_filename = "tmp.log"
+script_content = {'idx': 0, 'cmd': '', 'wait_str': '', 'timeout': 0, 'exe_mode': 0, 'next': 0}
+script_list = []
+script_content['idx'] = 0
+script_content['cmd'] = 'sh /sdk/insmod_rndis.sh\r\n'
+script_content['wait_str'] = '<USB>[EP][2] Enable for BULK OUT with maxpacket/fifo(512/1024)\r\r\n'
+script_content['timeout'] = 3
+script_content['exe_mode'] = 1
+script_content['next'] = script_content['idx'] + 1
+script_list.append(script_content.copy())
+
+script_content['idx'] = 1
+script_content['cmd'] = 'ifconfig usb0 192.168.100.99\r\n'
+script_content['wait_str'] = '/ # \r\n'
+script_content['timeout'] = 1
+script_content['exe_mode'] = 1
+script_content['next'] = script_content['idx'] + 1
+script_list.append(script_content.copy())
 
 # Read boot log into a dictionary before start program.
 with open('data.json', 'r') as reader:
@@ -74,17 +95,20 @@ def on_press(key):
 def job_uart_read(arg, serialDev):
     t = threading.currentThread()
     # print ("working on %s" % arg)
+    global log_filename
 
     # Force to convert system encoding
     reload(sys)
     sys.setdefaultencoding('utf-8')
 
     while getattr(t, "do_run", True):
-        while serialDev.in_waiting:          # 若收到序列資料…
+        while serialDev.in_waiting:  # 若收到序列資料…
             data_raw = serialDev.readline()  # 讀取一行
             # data = data_raw.decode()   # 用預設的UTF-8解碼
             if SHOW_DBG_MSG:
                 print('* %s %s' % (datetime.now(), repr(data_raw)))  # Escape newline characters
+            with open(log_filename, "a+") as myfile:
+                myfile.write('%s %s\n' % (datetime.now(), repr(data_raw)))
             check_booting(data_raw)
             uart_read_q.put(data_raw)
         time.sleep(0.1)
@@ -133,13 +157,41 @@ def job_uart_send(arg, serialDev):
 def job_uart_parser(arg):
     t = threading.currentThread()
     # print ("working on %s" % arg)
+    global new_start_flag
     pass_count = 0
+    cmd = {'idx': -1, 'timestamp': datetime.now()}
 
     while getattr(t, "do_run", True):
+        while not uart_cmd_request_q.empty():
+            cmd['idx'] = uart_cmd_request_q.get()
+            cmd['timestamp'] = datetime.now()
+            # print("%s wait uart_cmd_request_q = %s" % (datetime.now(), cmd['idx']))
+        # To prevent while consuming too much cpu usage.
+        time.sleep(0.1)
         while not uart_read_q.empty():
             data = uart_read_q.get()
             # print(repr(data))
-            # check_booting(data)
+            if cmd['idx'] == script_list[0]['idx']:
+                # print("Parser checking cmd: %s \n" % (repr(script_list[0]['wait_str'])))
+                if check_string_match(data, script_list[0]['wait_str']):
+                    uart_cmd_response_q.put('pass')
+                    cmd['idx'] = script_list[0]['idx'] + 1
+                elif check_string_match(data, "insmod: can't insert"):
+                    uart_cmd_response_q.put('pass')
+                    cmd['idx'] = script_list[1]['idx'] + 1
+                elif (datetime.now() - cmd['timestamp']).total_seconds() >= script_list[0]['timeout']:
+                    print("Timeout: %s" % (datetime.now() - cmd['timestamp']).total_seconds())
+                    uart_cmd_response_q.put('timeout')
+                    cmd['idx'] = script_list[0]['idx'] + 1
+            if cmd['idx'] == script_list[1]['idx']:
+                # print("Parser checking cmd: %s \n" % (repr(script_list[1]['wait_str'])))
+                if check_string_match(data, script_list[1]['wait_str']):
+                    uart_cmd_response_q.put('pass')
+                    cmd['idx'] = script_list[1]['idx'] + 1
+                elif (datetime.now() - cmd['timestamp']).total_seconds() >= script_list[1]['timeout']:
+                    print("Timeout: %s" % (datetime.now() - cmd['timestamp']).total_seconds())
+                    uart_cmd_response_q.put('timeout')
+                    cmd['idx'] = script_list[1]['idx'] + 1
             if check_string_match(data, "100%"):
                 pass_count += 1
                 print_pass_msg(pass_count)
@@ -148,7 +200,23 @@ def job_uart_parser(arg):
                 do_power_off()
                 set_uart_console_reg("status", "HALTED")  # HALTED
                 print('%s %s %s' % (datetime.now(), "AC Power OFF", uart_console["status"]))
-                print("----------------------------------------------------------------")
+                print("--------------------------- Test End ---------------------------")
+                with open(log_filename, "a+") as myfile:
+                    myfile.write("--------------------------- Test End ---------------------------\n")
+                threads[3].do_run = False
+                threads[4].do_run = False
+                new_start_flag = True
+                cmd['idx'] = -1
+                threads[3].do_run = True
+                threads[4].do_run = True
+                print("Set new_start_flag = true")
+                print("Clear queues.")
+                uart_send_q.queue.clear()
+                uart_read_q.queue.clear()
+                # ips_send_q.queue.clear()
+                # ips_check_pwr_q.queue.clear()
+                uart_cmd_request_q.queue.clear()
+                uart_cmd_response_q.queue.clear()
             if check_string_match(data, "SigmaStar # \r\n"):
                 uart_send_q.put('reset\r\n')
         # To prevent while consuming too much cpu usage.
@@ -161,6 +229,11 @@ def print_pass_msg(pass_count):
     print("|      PASS      |")
     print("+----------------+")
     print("Pass Count: %d" % pass_count)
+    with open(log_filename, "a+") as myfile:
+        myfile.write('+----------------+\n')
+        myfile.write('|      PASS      |\n')
+        myfile.write('+----------------+\n')
+        myfile.write('Pass Count: %d\n' % pass_count)
     set_uart_console_reg("status", "WAITING")  # WAITING
 
     return 0
@@ -172,13 +245,20 @@ def job_auto_test(arg):
     halted_count = 0
     freeze_count = 0
     waiting_count = 0
+    cmd_idx = 0
     global power_flag
+    global new_start_flag
 
     while getattr(t, "do_run", True):
         # print("----- new loop start -----")
-        # if power_flag != 'ON':
-        #     check_power(IPS_800_ser)
-        #     print(ips_check_pwr_q.get())
+        if new_start_flag:
+            print("new_start_flag = True, initial all variable of job_auto_test()")
+            print("----------------------  Starting Test Now ----------------------")
+            halted_count = 0
+            freeze_count = 0
+            waiting_count = 0
+            cmd_idx = 0
+            new_start_flag = False
 
         if uart_console["status"] == "WAITING":
             print("I am waiting")
@@ -191,7 +271,7 @@ def job_auto_test(arg):
             time.sleep(1)
             continue
         if uart_console["status"] == "HALTED" or uart_console["status"] == "UNKNOWN":
-            print("----- enter HALTED & UNKNOWN check loop -----")
+            # print("----- enter HALTED & UNKNOWN check loop -----")
             check_power(IPS_800_ser)
             if ips_check_pwr_q.get() == 'ON':
                 print('%s Original status: %s' % (datetime.now(), uart_console["status"]))
@@ -218,7 +298,8 @@ def job_auto_test(arg):
                     if not check_string_match(uart_console["last_msg"], "Auto-Negotiation..."):
                         print("last_msg %s" % uart_console["last_msg"])
                         do_power_reset()
-                        print('%s %s %s' % (datetime.now(), "Booting hangup exception handler.", uart_console["status"]))
+                        print('%s %s %s' % (
+                        datetime.now(), "Booting hangup exception handler.", uart_console["status"]))
                     check_power(IPS_800_ser)
                     if ips_check_pwr_q.get() == 'OFF':
                         do_power_on()
@@ -226,7 +307,7 @@ def job_auto_test(arg):
             # print('.'),
             continue
         else:
-            print('%s %s %s' % (datetime.now(), "Start Testing", uart_console["status"]))
+            print('%s %s %s' % (datetime.now(), "Starting Run Script", uart_console["status"]))
 
         if uart_console["status"] == "HALTED":
             halted_count += 1
@@ -240,9 +321,21 @@ def job_auto_test(arg):
 
         if uart_console["status"] == "IDLE":
             print('%s %s %s' % (datetime.now(), "Send cmd: isnmod", uart_console["status"]))
-            uart_send_q.put('sh /sdk/insmod_rndis.sh\r\n')
+            if cmd_idx == script_list[0]['idx']:
+                uart_cmd_request_q.put(script_list[0]['idx'])
+                uart_send_q.put(script_list[0]['cmd'])
+                print("wait uart_cmd_response_q")
+                if uart_cmd_response_q.get() == "pass":
+                    cmd_idx += 1
+            # uart_send_q.put('sh /sdk/insmod_rndis.sh\r\n')
             print('%s %s %s' % (datetime.now(), "Send cmd: ifconfig", uart_console["status"]))
-            uart_send_q.put('ifconfig usb0 192.168.100.99\r\n')
+            if cmd_idx == script_list[1]['idx']:
+                uart_cmd_request_q.put(script_list[1]['idx'])
+                uart_send_q.put(script_list[1]['cmd'])
+                print("wait uart_cmd_response_q")
+                if uart_cmd_response_q.get() == "pass":
+                    cmd_idx += 1
+            # uart_send_q.put('ifconfig usb0 192.168.100.99\r\n')
             print('%s %s %s' % (datetime.now(), "Send cmd: tftp send file", uart_console["status"]))
             uart_send_q.put('tftp -p -l /config/pega/test.raw 192.168.100.200 -b 20000\r\n')
             print('%s %s %s' % (datetime.now(), "Send cmd: diag factory poweroff", uart_console["status"]))
@@ -376,7 +469,7 @@ listener = keyboard.Listener(on_press=on_press)
 listener.start()  # start to listen on a separate thread
 listener.join()  # remove if main thread is polling self.keys
 # 等待所有子執行緒結束
-for i in range(3):
+for i in range(4):
     threads[i].join()
 
 # print("Done.")
