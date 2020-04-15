@@ -8,6 +8,7 @@ import serial  # 引用pySerial模組
 from pynput import keyboard
 from datetime import datetime
 import queue  # 先进先出队列
+from tools import *
 
 # Public and global variable configure zone
 COM_PORT = 'COM4'    # 指定通訊埠名稱
@@ -22,7 +23,8 @@ uart_read_q = queue.Queue(10)
 ips_send_q = queue.Queue(1)
 ips_check_pwr_q = queue.Queue(1)
 
-SHOW_DBG_MSG = True
+# SHOW_DBG_MSG = True
+SHOW_DBG_MSG = False
 status_flag = ["IDLE", "BOOTING", "RUNNING", "HALTED", "UNKNOWN"]
 power_flag = ""
 uart_console = {"last_msg": "", "last_timestamp": datetime.now(), "status": status_flag[4]}
@@ -30,31 +32,6 @@ uart_console = {"last_msg": "", "last_timestamp": datetime.now(), "status": stat
 # Read boot log into a dictionary before start program.
 with open('data.json', 'r') as reader:
     boot_log = json.loads(reader.read())
-
-
-def info_filter(src_string):
-    start = "#INFO#"
-    end = "#END#\r\n"
-    subtract_prefix = (src_string.split(start))[1]
-    subtract_postfix = subtract_prefix.split(end)[0]
-    if ':' in subtract_postfix:
-        execution_result = subtract_postfix.split(':')[0]
-        info_string = subtract_postfix.split(':')[1]
-        if execution_result == '0':
-            return info_string
-        else:
-            return 0
-    else:
-        return subtract_postfix
-
-
-def search_log(hugedata, searchfor):
-    ignoreDict = ['\r\n', '/ # \r\n']
-    for key in hugedata.keys():
-        if searchfor == hugedata[key] and searchfor not in ignoreDict:
-            # update_info_reg(key, "BOOTING")
-            return key
-    return repr(searchfor)
 
 
 def on_press(key):
@@ -68,7 +45,7 @@ def on_press(key):
     if k in ['1', '2', 'left', 'right']:  # keys of interest
         print('Key pressed: ' + k)
     if k == '3':
-        check_power()
+        check_power(IPS_800_ser)
         # uart_send_q.put('reboot\r\n')
     if k == '4':
         print(uart_console['status'], uart_console['last_timestamp'], power_flag)
@@ -118,10 +95,6 @@ def job_ips_read(arg, serialDev):
     t = threading.currentThread()
     global power_flag
 
-    # Force to convert system encoding
-    reload(sys)
-    sys.setdefaultencoding('utf-8')
-
     while getattr(t, "do_run", True):
         while serialDev.in_waiting:
             ips_raw = serialDev.readline()
@@ -130,11 +103,9 @@ def job_ips_read(arg, serialDev):
                 if 'OFF' in ips_raw:
                     power_flag = "OFF"
                     ips_check_pwr_q.put(power_flag)
-                    # print('Power off')
                 else:
                     power_flag = "ON"
                     ips_check_pwr_q.put(power_flag)
-                    # print('Power on')
         time.sleep(0.1)
     # print("Stopping job %s." % arg)
 
@@ -154,8 +125,7 @@ def job_uart_send(arg, serialDev):
             if len(send_str) is not 0:
                 # print(send_str)
                 IPS_800_ser.writelines(send_str)
-
-# To prevent while consuming too much cpu usage.
+        # To prevent while consuming too much cpu usage.
         time.sleep(0.1)
     # print("Stopping job %s." % arg)
 
@@ -176,6 +146,7 @@ def job_uart_parser(arg):
             if check_string_match(data, "pegaDiag_FactoryPowerOff"):
                 print('%s %s %s' % (datetime.now(), "Stop Testing", uart_console["status"]))
                 do_power_off()
+                set_uart_console_reg("status", "HALTED")  # HALTED
                 print('%s %s %s' % (datetime.now(), "AC Power OFF", uart_console["status"]))
                 print("----------------------------------------------------------------")
             if check_string_match(data, "SigmaStar # \r\n"):
@@ -190,35 +161,41 @@ def print_pass_msg(pass_count):
     print("|      PASS      |")
     print("+----------------+")
     print("Pass Count: %d" % pass_count)
-    update_uart_console_reg("status", "HALTED")  # HALTED
+    set_uart_console_reg("status", "WAITING")  # WAITING
 
     return 0
 
 
 def job_auto_test(arg):
-    # return 0
     t = threading.currentThread()
     # print ("working on %s" % arg)
     halted_count = 0
     freeze_count = 0
+    waiting_count = 0
     global power_flag
 
     while getattr(t, "do_run", True):
-        # print(4"----- new loop start -----")
-        if power_flag != 'ON':
-            check_power()
-            wait_power = ips_check_pwr_q.get()
+        # print("----- new loop start -----")
+        # if power_flag != 'ON':
+        #     check_power(IPS_800_ser)
+        #     print(ips_check_pwr_q.get())
 
         if uart_console["status"] == "WAITING":
             print("I am waiting")
+            waiting_count += 1
+            if waiting_count >= 5:
+                uart_send_q.put('diag factory poweroff\r\n')
+                waiting_count = 0
+                time.sleep(3)
+                do_power_reset()
             time.sleep(1)
             continue
         if uart_console["status"] == "HALTED" or uart_console["status"] == "UNKNOWN":
-            if power_flag == 'ON':
-                # print('%s %s %s' % (datetime.now(), "AC Power ON", uart_console["status"]))
-                # do_power_on()
+            print("----- enter HALTED & UNKNOWN check loop -----")
+            check_power(IPS_800_ser)
+            if ips_check_pwr_q.get() == 'ON':
                 print('%s Original status: %s' % (datetime.now(), uart_console["status"]))
-                update_uart_console_reg("status", "RUNNING")
+                set_uart_console_reg("status", "RUNNING")
                 print('%s Changed status: %s' % (datetime.now(), uart_console["status"]))
             else:
                 print('%s %s %s' % (datetime.now(), "AC Power ON", uart_console["status"]))
@@ -229,12 +206,12 @@ def job_auto_test(arg):
             if uart_console["status"] == "RUNNING":  # and is_idle():
                 # print("last message %s" % repr(uart_console["last_msg"]))
                 if is_idle():
-                    update_uart_console_reg("status", "IDLE")
+                    set_uart_console_reg("status", "IDLE")
                 else:
                     freeze_count += 1
                 if freeze_count >= 3:
-                    freeze_count = 0
                     do_power_reset()
+                    freeze_count = 0
             else:  # BOOTING mode
                 # Booting mode exception handler
                 if (datetime.now() - uart_console['last_timestamp']).total_seconds() > 2:
@@ -242,6 +219,9 @@ def job_auto_test(arg):
                         print("last_msg %s" % uart_console["last_msg"])
                         do_power_reset()
                         print('%s %s %s' % (datetime.now(), "Booting hangup exception handler.", uart_console["status"]))
+                    check_power(IPS_800_ser)
+                    if ips_check_pwr_q.get() == 'OFF':
+                        do_power_on()
             time.sleep(1)
             # print('.'),
             continue
@@ -254,7 +234,7 @@ def job_auto_test(arg):
             if halted_count >= 3:
                 do_power_reset()
                 halted_count = 0
-                print('%s %s %s' % (datetime.now(), "AC Power Reset", uart_console["status"]))
+                # print('%s %s %s' % (datetime.now(), "AC Power Reset", uart_console["status"]))
                 power_flag = 'RESET'
             continue
 
@@ -268,24 +248,17 @@ def job_auto_test(arg):
             print('%s %s %s' % (datetime.now(), "Send cmd: diag factory poweroff", uart_console["status"]))
             uart_send_q.put('diag factory poweroff\r\n')
             time.sleep(2)
-            # update_uart_console_reg("status", "HALTED")  # HALTED
-            update_uart_console_reg("status", "WAITING")  # HALTED
-        # while not is_idle():
-        #     print(uart_console_reg["status"])
-        #     time.sleep(1)
-        # if uart_console["status"] == "BOOTING":
-        #     print("----- STOP ME -----")
-        #     continue
+            set_uart_console_reg("status", "WAITING")  # HALTED
         # To prevent while consuming too much cpu usage.
         time.sleep(0.5)
     # print("Stopping job %s." % arg)
 
 
-def check_power():
+def check_power(serialDev):
     global power_flag
     # power_flag = 'UNKNOWN'
     print('%s %s %s' % (datetime.now(), "Do check_power()", uart_console["status"]))
-    IPS_800_ser.writelines('/S\r')
+    serialDev.writelines('/S\r')
     return 0
 
 
@@ -297,20 +270,20 @@ def check_booting(console_log):
     match_result = search_log(boot_log, console_log)
     if isinstance(match_result, unicode):
         # print(repr(console_log))
-        update_uart_console_reg("status", "BOOTING")
+        set_uart_console_reg("status", "BOOTING")
         # print("*"),
-    else:
-        print("-"),
+    # else:
+    #     print("-"),
 
     BOOT_FINISHED_PATTERN = "#INFO#DIAG_START#END#\r\n"
     if console_log == BOOT_FINISHED_PATTERN:
-        update_uart_console_reg("status", "IDLE")
+        set_uart_console_reg("status", "IDLE")
         print('\n%s %s' % (datetime.now(), "Boot Finished!"))
 
     # if time_sec_diff > 0:
     #     print(time_sec_diff)
-    update_uart_console_reg("last_msg", console_log)
-    update_uart_console_reg("last_timestamp", datetime.now())
+    set_uart_console_reg("last_msg", console_log)
+    set_uart_console_reg("last_timestamp", datetime.now())
 
     return 0
 
@@ -324,8 +297,8 @@ def check_string_match(console_log, keyword):
 def do_power_reset():
     global power_flag
     power_flag = 'UNKNOWN'
-    uart_console["status"] = "UNKNOWN"
-    print('%s %s %s' % (datetime.now(), "Call do_power_reset()", repr(uart_console["last_msg"])))
+    set_uart_console_reg('status', 'UNKNOWN')
+    print('%s %s %s' % (datetime.now(), "Call do_power_reset()", repr(get_uart_console_reg('last_msg'))))
     ips_send_q.put('/OFF 5\r')
     time.sleep(1)
     ips_send_q.put('/ON 5\r')
@@ -336,43 +309,47 @@ def do_power_reset():
 def do_power_on():
     print('%s %s' % (datetime.now(), "Call do_power_on()"))
     ips_send_q.put('/ON 5\r')
-    uart_console["status"] = "BOOTING"
+    set_uart_console_reg('status', 'BOOTING')
     return 0
 
 
 def do_power_off():
     global power_flag
-    power_flag = 'UNKNOWN'
-    uart_console["status"] = "UNKNOWN"
-    print('%s %s' % (datetime.now(), "Call do_power_off()"))
     ips_send_q.put('/OFF 5\r')
+    power_flag = 'UNKNOWN'
+    set_uart_console_reg('status', 'UNKNOWN')
+    print('%s %s' % (datetime.now(), "Call do_power_off()"))
     return 0
 
 
 def is_idle():
     if uart_console["last_msg"] != "Auto-Negotiation...":
-        print('%s %s Mode: %s' % (datetime.now(), "Do is_idle() checking", uart_console["status"]))
+        print('%s %s Mode: %s' % (datetime.now(), "Do is_idle() checking", get_uart_console_reg('status')))
         uart_send_q.put('\r\n')
         time.sleep(0.5)
-        # print(uart_console["last_msg"])
         last_reply = (datetime.now() - uart_console["last_timestamp"]).total_seconds()
-        # if last_reply < 1 and uart_console["last_msg"] == "/ # \r\n":
         if last_reply < 1 and uart_console["last_msg"] != "":
-            # print('%s %s %s' % (datetime.now(), "running is_idle()", uart_console["status"]))
             return 1
     return 0
 
 
-def update_uart_console_reg(target, data):
-    if data == "IDLE":
-        print("someone set status to idle.")
+def set_uart_console_reg(target, data):
     if target == "last_msg":
         uart_console['last_msg'] = data
     if target == "last_timestamp":
         uart_console['last_timestamp'] = data
     if target == "status":
-        # print("Change status to %s" % data)
         uart_console['status'] = data  # status_flag = ["IDLE", "BOOTING", "RUNNING", "HANGUP"]
+    return 0
+
+
+def get_uart_console_reg(target):
+    if target == "last_msg":
+        return uart_console['last_msg']
+    if target == "last_timestamp":
+        return uart_console['last_timestamp']
+    if target == "status":
+        return uart_console['status']
     return 0
 
 
