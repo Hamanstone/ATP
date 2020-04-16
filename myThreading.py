@@ -183,23 +183,21 @@ def job_uart_send(arg, serialDev):
 def job_uart_parser(arg):
 	t = threading.currentThread()
 	# print ("working on %s" % arg)
-	global new_start_flag
-	pass_count = 0
 	cmd = {'idx': -1, 'timestamp': datetime.now()}
 
 	while getattr(t, "do_run", True):
-		while not uart_read_q.empty():
-			data = uart_read_q.get()
-			# print(repr(data))
+		while not uart_read_q.empty() or not uart_cmd_request_q.empty():
 			if not uart_cmd_request_q.empty():
 				cmd['idx'] = uart_cmd_request_q.get()
 				cmd['timestamp'] = datetime.now()
 				uart_send_q.put(script_list[cmd['idx']]['cmd'])
+			if not uart_read_q.empty():
+				data = uart_read_q.get()
+				# print(repr(data))
+				cmd['idx'] = result_compare_engine(cmd['idx'], cmd['timestamp'], data)
 
-			cmd['idx'] = result_compare_engine(cmd['idx'], cmd['timestamp'], data)
-
-			if check_string_match(data, "SigmaStar # \r\n"):
-				uart_send_q.put('reset\r\n')
+				if check_string_match(data, "SigmaStar # \r\n"):
+					uart_send_q.put('reset\r\n')
 		# To prevent while consuming too much cpu usage.
 		time.sleep(0.1)
 	# print("Stopping job %s." % arg)
@@ -209,6 +207,7 @@ def restart_process():
 	global new_start_flag
 	global input_count
 
+	set_uart_console_reg("status", "HALTED")  # HALTED
 	input_count += 1
 	new_start_flag = True
 	threads[3].do_run = False
@@ -266,6 +265,7 @@ def retry_func(var, delay, times, do_func):
 	time.sleep(delay)
 	var += 1
 	if var >= times:
+		print("Enter retry state. over the boundary.")
 		do_func()
 		var = 0
 	return var
@@ -273,7 +273,7 @@ def retry_func(var, delay, times, do_func):
 
 def do_diag_poweroff():
 	uart_send_q.put('diag factory poweroff\r\n')
-	time.sleep(3)
+	# time.sleep(3)
 	do_power_reset()
 
 
@@ -345,7 +345,7 @@ def job_auto_test(arg):
 
 		if uart_console["status"] == "IDLE":
 			command_dispatcher()
-			set_uart_console_reg("status", "WAITING")  # HALTED
+			# set_uart_console_reg("status", "WAITING")  # HALTED
 		# To prevent while consuming too much cpu usage.
 		time.sleep(0.5)
 	# print("Stopping job %s." % arg)
@@ -362,7 +362,10 @@ def command_dispatcher():
 		print('%s Send cmd: %s %s' % (datetime.now(), script_list[inner_idx]['comment'], uart_console["status"]))
 		# uart_send_q.put(script_list[inner_idx]['cmd'])
 		uart_cmd_request_q.put(script_list[inner_idx]['idx'])
-		# print("waiting uart_cmd_response_q count=%d" % inner_idx)
+		queue_dbg_str = "%s [QUEUE] => Sending uart_cmd_request_q = %d" % (datetime.now(), inner_idx)
+		print(queue_dbg_str)
+		with open(log_filename, "a+") as myfile:
+			myfile.write(queue_dbg_str+'\n')
 		response = uart_cmd_response_q.get()
 		# print(response+'\n')
 		if response != 'pass':
