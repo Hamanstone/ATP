@@ -17,9 +17,12 @@ def info_filter(src_string):
 def search_log(hugedata, searchfor):
     ignoreDict = ['\r\n', '/ # \r\n']
     for key in hugedata.keys():
-        if searchfor == hugedata[key] and searchfor not in ignoreDict:
-            # update_info_reg(key, "BOOTING")
-            return key
+        try:
+            if searchfor == hugedata[key] and searchfor not in ignoreDict:
+                # update_info_reg(key, "BOOTING")
+                return key
+        except Exception:
+            pass
     return repr(searchfor)
 
 

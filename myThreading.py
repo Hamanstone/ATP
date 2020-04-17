@@ -1,6 +1,7 @@
 # coding=utf-8
 
 import sys
+import os
 import threading
 import time
 import json
@@ -18,8 +19,8 @@ IPS_800_COM_PORT = 'COM3'
 IPS_800_BAUD_RATES = 9600
 IPS_800_ser = serial.Serial(IPS_800_COM_PORT, IPS_800_BAUD_RATES)
 # 最多接收10个数据
-uart_send_q = queue.Queue(10)
-uart_read_q = queue.Queue(10)
+uart_send_q = queue.Queue(1)
+uart_read_q = queue.Queue(5)
 ips_send_q = queue.Queue(1)
 ips_check_pwr_q = queue.Queue(1)
 uart_cmd_request_q = queue.Queue(1)
@@ -33,7 +34,7 @@ new_start_flag = True
 input_count = 1
 fail_count = 0
 uart_console = {"last_msg": "", "last_timestamp": datetime.now(), "status": status_flag[4]}
-log_filename = ("%s.log" % datetime.now().strftime("%Y%m%d%H%M%S"))
+log_filename = ("log/%s.log" % datetime.now().strftime("%Y%m%d%H%M%S"))
 script_content = {'idx': 0, 'cmd': '', 'wait_str': '', 'timeout': 0, 'exe_mode': 0, 'next': 0}
 script_list = []
 script_content['idx'] = 0
@@ -47,7 +48,7 @@ script_list.append(script_content.copy())
 
 script_content['idx'] = 1
 script_content['cmd'] = 'ifconfig usb0 192.168.100.99; cd /config/pega\r\n'
-script_content['wait_str'] = '/config/pega # \r\n'
+script_content['wait_str'] = '/config/pega # '
 script_content['timeout'] = 1
 script_content['exe_mode'] = 1
 script_content['comment'] = 'ifconfig set IP and change DIR'
@@ -76,8 +77,12 @@ script_list.append(script_content.copy())
 with open('data.json', 'r') as reader:
 	boot_log = json.loads(reader.read())
 
+if not os.path.exists('log'):
+	os.makedirs('log')
+
 
 def on_press(key):
+	return 0
 	if key == keyboard.Key.esc:
 		return False  # stop listener
 	try:
@@ -215,11 +220,6 @@ def restart_process():
 	threads[3].do_run = True
 	threads[4].do_run = True
 	print("Set new_start_flag = True")
-	uart_send_q.queue.clear()
-	uart_read_q.queue.clear()
-	uart_cmd_request_q.queue.clear()
-	uart_cmd_response_q.queue.clear()
-	print("Clear queues.")
 
 
 def result_compare_engine(cmd_idx, cmd_receive_timestamp, tmp_data):
@@ -228,18 +228,18 @@ def result_compare_engine(cmd_idx, cmd_receive_timestamp, tmp_data):
 	# with open(log_filename, "a+") as myfile:
 	# 	myfile.write("%s %s [%s]" % (datetime.now(), repr(tmp_data), repr(script_list[cmd_idx]['wait_str'])))
 	if check_string_match(tmp_data, script_list[cmd_idx]['wait_str']):
-		uart_cmd_response_q.put('pass')
+		uart_cmd_response_q.put({'idx': cmd_idx, 'result': 'pass'})
 		with open(log_filename, "a+") as myfile:
 			myfile.write("%s [DUT] == %s\n" % (datetime.now(), repr(tmp_data)))
 		return cmd_idx + 1
-	elif check_string_match(tmp_data, "insmod: can't insert"):
-		uart_cmd_response_q.put('pass')
+	elif check_string_match(tmp_data, "g_ether.ko"):
+		uart_cmd_response_q.put({'idx': cmd_idx, 'result': 'pass'})
 		with open(log_filename, "a+") as myfile:
 			myfile.write("%s [DUT] == %s\n" % (datetime.now(), repr(tmp_data)))
 		return cmd_idx + 1
 	elif ((datetime.now() - cmd_receive_timestamp).total_seconds()) >= script_list[cmd_idx]['timeout']:
 		# print("Timeout: %s [%s]" % ((datetime.now() - cmd['timestamp']).total_seconds(), script_list[cmd_idx]['timeout']))
-		uart_cmd_response_q.put('timeout')
+		uart_cmd_response_q.put({'idx': cmd_idx, 'result': 'timeout'})
 		return cmd_idx + 1
 
 	return cmd_idx
@@ -261,7 +261,10 @@ def print_pass_msg(pass_count):
 
 
 def retry_func(var, delay, times, do_func):
-	print("retry_func() will call %s() after %d retry." % (do_func.__name__, times))
+	status = get_uart_console_reg("status")
+	print("retry_func() will call %s() after %d(%f) retry. STATUS:%s" % (do_func.__name__, times, delay, status))
+	if status == 'BOOTING':
+		return 0
 	time.sleep(delay)
 	var += 1
 	if var >= times:
@@ -295,11 +298,16 @@ def job_auto_test(arg):
 			print("new_start_flag = True, initial all variable of job_auto_test()")
 			print("----------------------- Starting Test Now ----------------------")
 			print("Current input count: %d" % input_count)
-			log_filename = ("%s.log" % datetime.now().strftime("%Y%m%d%H%M%S"))
+			log_filename = ("log/%s.log" % datetime.now().strftime("%Y%m%d%H%M%S"))
 			print("filename: %s" % log_filename)
 			halted_count = 0
 			freeze_count = 0
 			waiting_count = 0
+			uart_send_q.queue.clear()
+			uart_read_q.queue.clear()
+			uart_cmd_request_q.queue.clear()
+			uart_cmd_response_q.queue.clear()
+			print("Clear queues.")
 			# cmd_idx = 0
 			new_start_flag = False
 
@@ -309,11 +317,14 @@ def job_auto_test(arg):
 		if uart_console["status"] == "HALTED" or uart_console["status"] == "UNKNOWN":
 			# print("----- enter HALTED & UNKNOWN check loop -----")
 			check_power(IPS_800_ser)
-			if ips_check_pwr_q.get() == 'ON':
-				set_uart_console_reg("status", "RUNNING")
-			else:
-				do_power_on()
-				time.sleep(1)
+			try:
+				if ips_check_pwr_q.get(True, 3) == 'ON':
+					set_uart_console_reg("status", "RUNNING")
+				else:
+					do_power_on()
+					time.sleep(1)
+			except Exception:
+				print("*** waiting for ips_check_pwr_q timeout(3s)")
 
 		if uart_console["status"] == "BOOTING" or uart_console["status"] == "RUNNING":
 			if uart_console["status"] == "RUNNING":  # and is_idle():
@@ -321,7 +332,7 @@ def job_auto_test(arg):
 				if is_idle():
 					set_uart_console_reg("status", "IDLE")
 				else:
-					freeze_count = retry_func(freeze_count, 0, 3, do_power_reset)
+					freeze_count = retry_func(freeze_count, 0.1, 1, do_power_reset)
 			else:  # BOOTING mode
 				# Booting mode exception handler
 				if (datetime.now() - uart_console['last_timestamp']).total_seconds() > 2:
@@ -340,7 +351,7 @@ def job_auto_test(arg):
 			print('%s %s %s' % (datetime.now(), "Starting Run Script", uart_console["status"]))
 
 		if uart_console["status"] == "HALTED":
-			halted_count = retry_func(halted_count, 0.5, 3, do_power_reset)
+			halted_count = retry_func(halted_count, 0.5, 1, do_power_reset)
 			continue
 
 		if uart_console["status"] == "IDLE":
@@ -358,19 +369,25 @@ def command_dispatcher():
 	global fail_count
 	global input_count
 
+	print(">>> uart_cmd_request_q.len = %d, uart_cmd_response_q.len = %d <<<" % (uart_cmd_request_q.qsize(), uart_cmd_response_q.qsize()))
+	# Just in case to prevent queue left when a new session start will cause something wrong.
+	uart_cmd_response_q.queue.clear()
+	uart_cmd_request_q.queue.clear()
 	while inner_idx <= len(script_list) - 1:
 		print('%s Send cmd: %s %s' % (datetime.now(), script_list[inner_idx]['comment'], uart_console["status"]))
 		# uart_send_q.put(script_list[inner_idx]['cmd'])
 		uart_cmd_request_q.put(script_list[inner_idx]['idx'])
 		queue_dbg_str = "%s [QUEUE] => Sending uart_cmd_request_q = %d" % (datetime.now(), inner_idx)
 		print(queue_dbg_str)
-		with open(log_filename, "a+") as myfile:
-			myfile.write(queue_dbg_str+'\n')
+		with open(log_filename, "a+") as logfile:
+			logfile.write(queue_dbg_str+'\n')
 		response = uart_cmd_response_q.get()
-		# print(response+'\n')
-		if response != 'pass':
+		if response['idx'] != inner_idx and response['result'] != 'pass':
 			fail_step_count += 1
-			print("*** fail on step %d" % inner_idx)
+			queue_dbg_str = "%s [DBG] => Fail on step %d, response = %s" % (datetime.now(), inner_idx, response)
+			print(queue_dbg_str)
+			with open(log_filename, "a+") as logfile:
+				logfile.write(queue_dbg_str + '\n')
 		# retry statement
 		# if inner_idx == 2 and response == 'pass':
 		# 	continue
@@ -384,8 +401,8 @@ def command_dispatcher():
 	print('%s %s %s' % (datetime.now(), "Stop Testing", uart_console["status"]))
 	do_power_off()
 	print("--------------------------- Test End ---------------------------")
-	with open(log_filename, "a+") as myfile:
-		myfile.write("--------------------------- Test End ---------------------------\n")
+	with open(log_filename, "a+") as logfile:
+		logfile.write("--------------------------- Test End ---------------------------\n")
 	restart_process()
 
 	# print("released from script_dispatcher() function loop.")
