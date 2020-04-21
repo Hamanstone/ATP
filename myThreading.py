@@ -25,6 +25,8 @@ ips_send_q = queue.Queue(1)
 ips_check_pwr_q = queue.Queue(1)
 uart_cmd_request_q = queue.Queue(1)
 uart_cmd_response_q = queue.Queue(1)
+process_is_idle_r_q = queue.Queue(1)
+process_is_idle_w_q = queue.Queue(1)
 
 # SHOW_DBG_MSG = True
 SHOW_DBG_MSG = False
@@ -191,7 +193,7 @@ def job_uart_parser(arg):
 	cmd = {'idx': -1, 'timestamp': datetime.now()}
 
 	while getattr(t, "do_run", True):
-		while not uart_read_q.empty() or not uart_cmd_request_q.empty():
+		while not uart_read_q.empty() or not uart_cmd_request_q.empty() or not process_is_idle_r_q.empty():
 			if not uart_cmd_request_q.empty():
 				cmd['idx'] = uart_cmd_request_q.get()
 				cmd['timestamp'] = datetime.now()
@@ -203,6 +205,11 @@ def job_uart_parser(arg):
 
 				if check_string_match(data, "SigmaStar # \r\n"):
 					uart_send_q.put('reset\r\n')
+				if check_string_match(data, "# \r\n"):
+					if not process_is_idle_w_q.empty():
+						print('%s %s received @ parser' % (datetime.now(), process_is_idle_w_q.get()))
+						process_is_idle_r_q.put({'timestamp': datetime.now(), 'msg': 'process_is_idle_w_q received @ parser.'})
+					# is_idle()
 		# To prevent while consuming too much cpu usage.
 		time.sleep(0.1)
 	# print("Stopping job %s." % arg)
@@ -250,11 +257,26 @@ def print_pass_msg(pass_count):
 	print("|      PASS      |")
 	print("+----------------+")
 	print("Pass Count: %d" % pass_count)
-	with open(log_filename, "a+") as myfile:
-		myfile.write('+----------------+\n')
-		myfile.write('|      PASS      |\n')
-		myfile.write('+----------------+\n')
-		myfile.write('Pass Count: %d\n' % pass_count)
+	with open(log_filename, "a+") as logfile:
+		logfile.write('+----------------+\n')
+		logfile.write('|      PASS      |\n')
+		logfile.write('+----------------+\n')
+		logfile.write('Pass Count: %d\n' % pass_count)
+	set_uart_console_reg("status", "WAITING")  # WAITING
+
+	return 0
+
+
+def print_fail_msg(fail_count):
+	print("+----------------+")
+	print("|      FAIL      |")
+	print("+----------------+")
+	print("Pass Count: %d" % fail_count)
+	with open(log_filename, "a+") as logfile:
+		logfile.write('+----------------+\n')
+		logfile.write('|      FAIL      |\n')
+		logfile.write('+----------------+\n')
+		logfile.write('Pass Count: %d\n' % fail_count)
 	set_uart_console_reg("status", "WAITING")  # WAITING
 
 	return 0
@@ -319,6 +341,7 @@ def job_auto_test(arg):
 			check_power(IPS_800_ser)
 			try:
 				if ips_check_pwr_q.get(True, 3) == 'ON':
+					print('%s Set mode to RUNNING. (job_auto_test)' % datetime.now())
 					set_uart_console_reg("status", "RUNNING")
 				else:
 					do_power_on()
@@ -382,8 +405,9 @@ def command_dispatcher():
 		with open(log_filename, "a+") as logfile:
 			logfile.write(queue_dbg_str+'\n')
 		response = uart_cmd_response_q.get()
-		if response['idx'] != inner_idx and response['result'] != 'pass':
+		if not response or (response['idx'] != inner_idx and response['result'] != 'pass'):
 			fail_step_count += 1
+			break;
 			queue_dbg_str = "%s [DBG] => Fail on step %d, response = %s" % (datetime.now(), inner_idx, response)
 			print(queue_dbg_str)
 			with open(log_filename, "a+") as logfile:
@@ -397,6 +421,7 @@ def command_dispatcher():
 		print_pass_msg(input_count - fail_count)
 	else:
 		fail_count += 1
+		print_fail_msg(fail_count)
 	set_uart_console_reg("status", "HALTED")  # HALTED
 	print('%s %s %s' % (datetime.now(), "Stop Testing", uart_console["status"]))
 	do_power_off()
@@ -461,9 +486,8 @@ def do_power_reset():
 
 
 def do_power_on():
-	print('%s %s' % (datetime.now(), "Call do_power_on()"))
+	print('%s %s STATUS = %s' % (datetime.now(), "Call do_power_on()", get_uart_console_reg('status')))
 	ips_send_q.put('/ON 5\r')
-	set_uart_console_reg('status', 'BOOTING')
 	return 0
 
 
@@ -479,10 +503,18 @@ def do_power_off():
 def is_idle():
 	if uart_console["last_msg"] != "Auto-Negotiation...":
 		print('%s %s Mode: %s' % (datetime.now(), "Do is_idle() checking", get_uart_console_reg('status')))
-		uart_send_q.put('\r\n')
-		time.sleep(0.5)
+		uart_send_q.put('1\r\n')
+		print('%s uart_send_q.put("1\\r\\n")' % datetime.now())
+		process_is_idle_w_q.put('is_idle')
+		print('%s process_is_idle_w_q.put' % datetime.now())
+		try:
+			print('%s is_idle() received at %s' % (datetime.now(), process_is_idle_r_q.get(True, 0.5)['timestamp']))
+		except Exception:
+			print('%s Waiting queue timeout.' % datetime.now())
+		# time.sleep(0.5)
+		print('%s %s %s' % (datetime.now(), repr(get_uart_console_reg('last_msg')), get_uart_console_reg('last_timestamp')))
 		last_reply = (datetime.now() - uart_console["last_timestamp"]).total_seconds()
-		if last_reply < 1 and uart_console["last_msg"] != "":
+		if last_reply < 1 and uart_console["last_msg"] == "/ # \r\n":
 			return 1
 	return 0
 
@@ -493,6 +525,8 @@ def set_uart_console_reg(target, data):
 	if target == "last_timestamp":
 		uart_console['last_timestamp'] = data
 	if target == "status":
+		if data == "RUNNING":
+			print('%s Set mode to %s' % (datetime.now(), data))
 		uart_console['status'] = data  # status_flag = ["IDLE", "BOOTING", "RUNNING", "HANGUP"]
 	return 0
 
