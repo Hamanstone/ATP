@@ -28,7 +28,8 @@ uart_cmd_response_q = queue.Queue(1)
 process_is_idle_r_q = queue.Queue(1)
 process_is_idle_w_q = queue.Queue(1)
 
-# SHOW_DBG_MSG = True
+# 全域變數專區
+BOOT_POINT = 0
 SHOW_DBG_MSG = False
 status_flag = ["IDLE", "BOOTING", "RUNNING", "HALTED", "UNKNOWN"]
 power_flag = ""
@@ -51,7 +52,7 @@ script_list.append(script_content.copy())
 script_content['idx'] = 1
 script_content['cmd'] = 'ifconfig usb0 192.168.100.99; cd /config/pega\r\n'
 script_content['wait_str'] = '/config/pega # '
-script_content['timeout'] = 1
+script_content['timeout'] = 3
 script_content['exe_mode'] = 1
 script_content['comment'] = 'ifconfig set IP and change DIR'
 script_content['next'] = script_content['idx'] + 1
@@ -198,6 +199,10 @@ def job_uart_parser(arg):
 				cmd['idx'] = uart_cmd_request_q.get()
 				cmd['timestamp'] = datetime.now()
 				uart_send_q.put(script_list[cmd['idx']]['cmd'])
+				queue_dbg_str = '%s [DBG] cmd[\'idx\']=%s, sent: %s' % (datetime.now(), cmd['idx'], repr(script_list[cmd['idx']]['cmd']))
+				print(queue_dbg_str)
+				with open(log_filename, "a+") as logfile:
+					logfile.write(queue_dbg_str+'\n')
 			if not uart_read_q.empty():
 				data = uart_read_q.get()
 				# print(repr(data))
@@ -232,22 +237,28 @@ def restart_process():
 def result_compare_engine(cmd_idx, cmd_receive_timestamp, tmp_data):
 	if cmd_idx >= len(script_list) or cmd_idx == -1:
 		return -1
-	# with open(log_filename, "a+") as myfile:
-	# 	myfile.write("%s %s [%s]" % (datetime.now(), repr(tmp_data), repr(script_list[cmd_idx]['wait_str'])))
+
+	if SHOW_DBG_MSG:
+		with open(log_filename, "a+") as logfile:
+			logfile.write("%s [DBG] SRC:%s, KEYWORD:[%s]\n" % (datetime.now(), repr(tmp_data), repr(script_list[cmd_idx]['wait_str'])))
+
 	if check_string_match(tmp_data, script_list[cmd_idx]['wait_str']):
 		uart_cmd_response_q.put({'idx': cmd_idx, 'result': 'pass'})
-		with open(log_filename, "a+") as myfile:
-			myfile.write("%s [DUT] == %s\n" % (datetime.now(), repr(tmp_data)))
-		return cmd_idx + 1
+		with open(log_filename, "a+") as logfile:
+			logfile.write("%s [DUT] == %s\n" % (datetime.now(), repr(tmp_data)))
+		return -1
 	elif check_string_match(tmp_data, "g_ether.ko"):
 		uart_cmd_response_q.put({'idx': cmd_idx, 'result': 'pass'})
-		with open(log_filename, "a+") as myfile:
-			myfile.write("%s [DUT] == %s\n" % (datetime.now(), repr(tmp_data)))
-		return cmd_idx + 1
+		with open(log_filename, "a+") as logfile:
+			logfile.write("%s [DUT] == %s\n" % (datetime.now(), repr(tmp_data)))
+		return -1
 	elif ((datetime.now() - cmd_receive_timestamp).total_seconds()) >= script_list[cmd_idx]['timeout']:
-		# print("Timeout: %s [%s]" % ((datetime.now() - cmd['timestamp']).total_seconds(), script_list[cmd_idx]['timeout']))
+		queue_dbg_str = "Timeout: %s [%s]" % ((datetime.now() - cmd_receive_timestamp).total_seconds(), script_list[cmd_idx]['timeout'])
+		print(queue_dbg_str)
+		with open(log_filename, "a+") as logfile:
+			logfile.write(queue_dbg_str+'\n')
 		uart_cmd_response_q.put({'idx': cmd_idx, 'result': 'timeout'})
-		return cmd_idx + 1
+		return -1
 
 	return cmd_idx
 
@@ -276,7 +287,7 @@ def print_fail_msg(fail_count):
 		logfile.write('+----------------+\n')
 		logfile.write('|      FAIL      |\n')
 		logfile.write('+----------------+\n')
-		logfile.write('Pass Count: %d\n' % fail_count)
+		logfile.write('Fail Count: %d\n' % fail_count)
 	set_uart_console_reg("status", "WAITING")  # WAITING
 
 	return 0
@@ -329,6 +340,7 @@ def job_auto_test(arg):
 			uart_read_q.queue.clear()
 			uart_cmd_request_q.queue.clear()
 			uart_cmd_response_q.queue.clear()
+			clear_uart_console_reg()
 			print("Clear queues.")
 			# cmd_idx = 0
 			new_start_flag = False
@@ -396,7 +408,7 @@ def command_dispatcher():
 	# Just in case to prevent queue left when a new session start will cause something wrong.
 	uart_cmd_response_q.queue.clear()
 	uart_cmd_request_q.queue.clear()
-	while inner_idx <= len(script_list) - 1:
+	while inner_idx < len(script_list):
 		print('%s Send cmd: %s %s' % (datetime.now(), script_list[inner_idx]['comment'], uart_console["status"]))
 		# uart_send_q.put(script_list[inner_idx]['cmd'])
 		uart_cmd_request_q.put(script_list[inner_idx]['idx'])
@@ -404,14 +416,24 @@ def command_dispatcher():
 		print(queue_dbg_str)
 		with open(log_filename, "a+") as logfile:
 			logfile.write(queue_dbg_str+'\n')
-		response = uart_cmd_response_q.get()
-		if not response or (response['idx'] != inner_idx and response['result'] != 'pass'):
+		try:
+			response = uart_cmd_response_q.get(True, script_list[inner_idx]['timeout'])
+		except Exception:
+			print('%s cmd[%d] was timeout.' % (datetime.now(), inner_idx))
+			response = {'idx': inner_idx, 'result': 'timeout', 'duration': script_list[inner_idx]['timeout']}
+		queue_dbg_str = "%s [QUEUE] <= Received uart_cmd_response_q = %s" % (datetime.now(), response)
+		print(queue_dbg_str)
+		with open(log_filename, "a+") as logfile:
+			logfile.write(queue_dbg_str + '\n')
+		if not response or response['idx'] != inner_idx or response['result'] != 'pass':
 			fail_step_count += 1
-			break;
+			print("Current fail_step_count = %d" % fail_step_count)
 			queue_dbg_str = "%s [DBG] => Fail on step %d, response = %s" % (datetime.now(), inner_idx, response)
 			print(queue_dbg_str)
 			with open(log_filename, "a+") as logfile:
 				logfile.write(queue_dbg_str + '\n')
+			inner_idx = len(script_list) # escape this while loop
+			print("Escape command_dispatcher() while loop.")
 		# retry statement
 		# if inner_idx == 2 and response == 'pass':
 		# 	continue
@@ -442,9 +464,23 @@ def check_power(serialDev):
 
 
 def check_booting(console_log):
-	time_sec_diff = (datetime.now() - uart_console['last_timestamp']).total_seconds()
+	global BOOT_POINT
+
+	if BOOT_POINT == 0:
+		BOOT_POINT = datetime.now()
+
+	# time_sec_diff = (datetime.now() - uart_console['last_timestamp']).total_seconds()
 	# if time_sec_diff > 1:
 	#     print("is_booting waiting 1 second.")
+
+	if BOOT_POINT == 0 or check_string_match(console_log, "IPL b4d3638"):
+		if BOOT_POINT == 0:
+			BOOT_POINT = datetime.now()
+		elif check_string_match(console_log, "IPL b4d3638"):
+			time_sec_diff = (datetime.now() - BOOT_POINT).total_seconds()
+			BOOT_POINT = datetime.now()
+			if time_sec_diff < 3:
+				do_power_reset()
 
 	match_result = search_log(boot_log, console_log)
 	if isinstance(match_result, unicode):
@@ -454,8 +490,10 @@ def check_booting(console_log):
 	# else:
 	#     print("-"),
 
-	BOOT_FINISHED_PATTERN = "#INFO#DIAG_START#END#\r\n"
-	if console_log == BOOT_FINISHED_PATTERN:
+	# BOOT_FINISHED_PATTERN = "#INFO#DIAG_START#END#\r\n"
+	BOOT_FINISHED_PATTERN = "false trigger"
+	# if console_log == BOOT_FINISHED_PATTERN:
+	if check_string_match(console_log, BOOT_FINISHED_PATTERN):
 		set_uart_console_reg("status", "IDLE")
 		print('\n%s %s' % (datetime.now(), "Boot Finished!"))
 
@@ -514,7 +552,7 @@ def is_idle():
 		# time.sleep(0.5)
 		print('%s %s %s' % (datetime.now(), repr(get_uart_console_reg('last_msg')), get_uart_console_reg('last_timestamp')))
 		last_reply = (datetime.now() - uart_console["last_timestamp"]).total_seconds()
-		if last_reply < 1 and uart_console["last_msg"] == "/ # \r\n":
+		if last_reply < 1 and check_string_match(uart_console["last_msg"], "# \r\n"):
 			return 1
 	return 0
 
@@ -539,6 +577,12 @@ def get_uart_console_reg(target):
 	if target == "status":
 		return uart_console['status']
 	return 0
+
+
+def clear_uart_console_reg():
+	uart_console['last_msg'] = ''
+	uart_console['last_timestamp'] = datetime.now()
+	uart_console['status'] = 'UNKNOWN'
 
 
 # 建立 4 個子執行緒
